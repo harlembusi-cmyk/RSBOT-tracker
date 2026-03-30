@@ -1,0 +1,194 @@
+-- ============================================================
+--  RobloxReporter
+--  Place in: ServerScriptService
+--  Fires game events to your Discord bot via RoTunnel proxy
+-- ============================================================
+
+local Players           = game:GetService("Players")
+local Teams             = game:GetService("Teams")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+-- ── Config ────────────────────────────────────────────────
+-- Replace with your RoTunnel forwarding URL (see SETUP.md)
+local PROXY_URL    = "https://f1dd-110-174-37-80.ngrok-free.app/event"
+local SECRET_KEY   = "changeme_secret_key" -- Must match ROBLOX_SECRET in your .env
+local PLACE_ID     = game.PlaceId
+local MIN_PLAYERS  = 10-- Must match bot.js MIN_PLAYERS_FOR_SESSION
+
+-- ── Player team tracking ───────────────────────────────────
+local playerTeams = {} -- username → current team name
+
+-- ── HTTP Helper ────────────────────────────────────────────
+local function sendEvent(data)
+	local ok, err = pcall(function()
+		HttpService:PostAsync(
+			PROXY_URL,
+			HttpService:JSONEncode(data),
+			Enum.HttpContentType.ApplicationJson,
+			false,
+			{ ["x-roblox-secret"] = SECRET_KEY }
+		)
+	end)
+	if not ok then
+		warn("[RobloxReporter] Failed to send event:", err)
+	end
+end
+
+-- ── Get all host team players ──────────────────────────────
+local function getHostPlayers()
+	local hosts = {}
+	for _, p in Players:GetPlayers() do
+		if p.Team and p.Team.Name:lower() == "host" then
+			table.insert(hosts, p.Name)
+		end
+	end
+	return hosts
+end
+
+-- ── Send player count update ───────────────────────────────
+local function sendPlayerCount()
+	sendEvent({
+		type        = "PlayerCount",
+		placeId     = PLACE_ID,
+		count       = #Players:GetPlayers(),
+		hostPlayers = getHostPlayers(),
+	})
+end
+
+-- ── Track team changes for a player ───────────────────────
+local function watchTeam(player)
+	local lastTeam = player.Team and player.Team.Name or nil
+	playerTeams[player.Name] = lastTeam
+
+	player:GetPropertyChangedSignal("Team"):Connect(function()
+		local newTeam = player.Team and player.Team.Name or "None"
+		local oldTeam = playerTeams[player.Name] or "None"
+
+		if newTeam ~= oldTeam then
+			playerTeams[player.Name] = newTeam
+			sendEvent({
+				type     = "TeamChange",
+				placeId  = PLACE_ID,
+				username = player.Name,
+				fromTeam = oldTeam,
+				toTeam   = newTeam,
+			})
+		end
+	end)
+end
+
+-- ── Player Join ────────────────────────────────────────────
+Players.PlayerAdded:Connect(function(player)
+	task.wait(1) -- give team time to assign
+
+	local team = player.Team and player.Team.Name or "None"
+	playerTeams[player.Name] = team
+
+	sendEvent({
+		type     = "PlayerJoin",
+		placeId  = PLACE_ID,
+		username = player.Name,
+		team     = team,
+	})
+
+	sendPlayerCount()
+	watchTeam(player)
+end)
+
+-- ── Player Leave ───────────────────────────────────────────
+Players.PlayerRemoving:Connect(function(player)
+	sendEvent({
+		type     = "PlayerLeave",
+		placeId  = PLACE_ID,
+		username = player.Name,
+	})
+
+	playerTeams[player.Name] = nil
+	task.wait(0.5)
+	sendPlayerCount()
+end)
+
+-- ── Hook into VotingServer vote results ────────────────────
+-- Waits for VotingRemotes to exist, then listens for UpdateHostPanel
+-- which carries the full snapshot whenever a vote ends
+
+task.spawn(function()
+	-- Wait for VotingRemotes folder to exist
+	local VotingRemotes = ReplicatedStorage:WaitForChild("VotingRemotes", 30)
+	if not VotingRemotes then
+		warn("[RobloxReporter] VotingRemotes not found — vote logging disabled")
+		return
+	end
+
+	local UpdateHostPanel = VotingRemotes:WaitForChild("UpdateHostPanel", 10)
+	if not UpdateHostPanel then
+		warn("[RobloxReporter] UpdateHostPanel not found — vote logging disabled")
+		return
+	end
+
+	-- We need to listen server-side, but UpdateHostPanel is a RemoteEvent
+	-- fired TO clients. We intercept via a BindableEvent bridge from VotingServer.
+	-- 
+	-- ADD THIS to your VotingServer.lua endVote() function (after notifyHosts):
+	--   local bridge = ReplicatedStorage:FindFirstChild("VoteResultBridge")
+	--   if bridge then bridge:Fire(lastSnapshot) end
+	--
+	-- And add this near the top of VotingServer.lua:
+	--   local bridge = Instance.new("BindableEvent")
+	--   bridge.Name = "VoteResultBridge"
+	--   bridge.Parent = ReplicatedStorage
+
+	local bridge = ReplicatedStorage:WaitForChild("VoteResultBridge", 30)
+	if not bridge then
+		warn("[RobloxReporter] VoteResultBridge BindableEvent not found — add it to VotingServer (see comments)")
+		return
+	end
+
+	bridge.Event:Connect(function(snapshot)
+		if not snapshot then return end
+		sendEvent({
+			type      = "VoteResult",
+			placeId   = PLACE_ID,
+			voteData  = {
+				voteCount    = snapshot.voteCount,
+				team         = snapshot.team,
+				tally        = snapshot.tally,    -- may need serialization, see note
+				voteReading  = snapshot.voteReading,
+				voteResult   = snapshot.voteResult,
+				votes        = snapshot.votes,
+				modifications= snapshot.modifications or {},
+			}
+		})
+	end)
+
+
+	print("[RobloxReporter] Vote result listener active")
+end)
+
+-- ── Periodic player count heartbeat (every 60s) ────────────
+task.spawn(function()
+	while true do
+		task.wait(60)
+		sendPlayerCount()
+	end
+end)
+
+-- ── Game end signal on server close ───────────────────────
+game:BindToClose(function()
+	sendEvent({
+		type    = "GameEnd",
+		placeId = PLACE_ID,
+	})
+end)
+
+-- ── Initial state on script load ──────────────────────────
+task.wait(3)
+for _, player in Players:GetPlayers() do
+	watchTeam(player)
+	playerTeams[player.Name] = player.Team and player.Team.Name or "None"
+end
+sendPlayerCount()
+
+print("[RobloxReporter] Ready — PlaceId:", PLACE_ID)
