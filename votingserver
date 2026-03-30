@@ -1,0 +1,500 @@
+-- ============================================================
+--  VotingServer
+--  Script — ServerScriptService
+-- ============================================================
+
+local Players           = game:GetService("Players")
+local Teams             = game:GetService("Teams")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local VoteResultBridge = Instance.new("BindableEvent")
+VoteResultBridge.Name = "VoteResultBridge"
+VoteResultBridge.Parent = ReplicatedStorage
+
+-- Helper function to check if player is a host
+local function isHost(player)
+	if player.Team then
+		local teamName = player.Team.Name:lower()
+		if teamName == "host" then return true end
+	end
+	return false
+end
+
+-- ── Remotes ────────────────────────────────────────────────
+local VotingRemotes = Instance.new("Folder")
+VotingRemotes.Name   = "VotingRemotes"
+VotingRemotes.Parent = ReplicatedStorage
+
+local function makeEvent(name)
+	local e = Instance.new("RemoteEvent"); e.Name = name; e.Parent = VotingRemotes; return e
+end
+
+local StartVote       = makeEvent("StartVote")
+local SubmitVote      = makeEvent("SubmitVote")
+local HostAction      = makeEvent("HostAction")
+local UpdateHostPanel = makeEvent("UpdateHostPanel")
+
+-- ── State ──────────────────────────────────────────────────
+local voteActive  = false
+local excluded    = {}
+local votes       = {}
+local hasVoted    = {}
+local lastTeam    = nil
+local voteCount   = 0
+local timerThread = nil
+
+-- ── Logging Helper ──────────────────────────────────────────
+local function log(...)
+	print("[VotingServer]", ...)
+end
+
+local function logExcluded()
+	log("Current excluded table:")
+	for userId, ex in pairs(excluded) do
+		local name = "Unknown"
+		for _, p in Players:GetPlayers() do
+			if p.UserId == userId then name = p.Name break end
+		end
+		log(string.format("  UserId %d (%s): canVote=%s, canBeVoted=%s, extraVotes=%d", userId, name, tostring(ex.canVote), tostring(ex.canBeVoted), ex.extraVotes or 0))
+	end
+	if next(excluded) == nil then
+		log("  (empty)")
+	end
+end
+
+local lastSnapshot = nil
+
+-- ── Helpers ────────────────────────────────────────────────
+local function getTeamMembers(teamName)
+	local members = {}
+	for _, p in Players:GetPlayers() do
+		if p.Team and p.Team.Name == teamName then
+			table.insert(members, p)
+		end
+	end
+	return members
+end
+
+local function buildTally()
+	local map = {}
+	for _, v in votes do
+		if not map[v.target] then
+			map[v.target] = { name = v.target, username = v.targetUsername, count = 0, votes = {} }
+		end
+		map[v.target].count += 1
+		table.insert(map[v.target].votes, { voter = v.voter, voterUsername = v.voterUsername, nickname = v.nickname })
+	end
+	local sorted = {}
+	for _, entry in map do table.insert(sorted, entry) end
+	table.sort(sorted, function(a,b) return a.count > b.count end)
+	return sorted
+end
+
+-- ── New: Build Vote Reading ────────────────────────────────
+local function buildVoteReading()
+	local tally = buildTally()
+	if #tally == 0 then return {}, "No votes cast" end
+
+	local totalVotes = #votes
+	local majority = math.floor(totalVotes / 2) + 1
+
+	local votePools = {}
+	for _, entry in tally do
+		votePools[entry.name] = {count = entry.count, votes = table.clone(entry.votes)}
+	end
+
+	local reading = {}
+	local currentIndex = 1
+	local peopleLeft = #tally
+
+	while peopleLeft > 0 do
+		local person = tally[currentIndex]
+		if votePools[person.name].count > 0 then
+			table.insert(reading, {
+				target = person.name,
+				voter = votePools[person.name].votes[1].voterUsername,
+				isMajority = false
+			})
+			table.remove(votePools[person.name].votes, 1)
+			votePools[person.name].count = votePools[person.name].count - 1
+			if votePools[person.name].count == 0 then
+				peopleLeft = peopleLeft - 1
+			end
+		end
+		currentIndex = currentIndex + 1
+		if currentIndex > #tally then currentIndex = 1 end
+	end
+
+	local counts = {}
+	for i, vote in reading do
+		counts[vote.target] = (counts[vote.target] or 0) + 1
+		if counts[vote.target] >= majority then
+			reading[i].isMajority = true
+			break
+		end
+	end
+
+	local result = "Elimination General Majority"
+	if #tally == 1 then
+		result = "Elimination Unanimous"
+	elseif #tally >= 2 and tally[1].count == tally[2].count then
+		result = "Tie"
+	elseif reading[#reading].isMajority then
+		result = "Elimination by Mathematical Majority"
+	end
+
+	return reading, result
+end
+
+-- ── Notify Hosts ──────────────────────────────────────────
+local function notifyHosts(extra)
+	local playerList = {}
+	for _, p in Players:GetPlayers() do
+		table.insert(playerList, { name = p.Name, displayName = p.DisplayName, userId = p.UserId })
+	end
+
+	-- Calculate total possible votes for the active team
+	local totalPossibleVotes = 0
+	if lastTeam then
+		local members = getTeamMembers(lastTeam)
+		for _, p in members do
+			local ex = excluded[p.UserId]
+			if not ex or ex.canVote then
+				local extraVotes = ex and ex.extraVotes or 0
+				totalPossibleVotes = totalPossibleVotes + 1 + extraVotes
+			end
+		end
+	end
+
+	local voteReading, voteResult = buildVoteReading()
+
+	local data = {
+		tally = buildTally(),
+		playerList = playerList,
+		excluded = excluded,
+		votes = votes,
+		voteActive = voteActive,
+		voteCount = voteCount,
+		voteReading = voteReading,
+		voteResult = voteResult,
+		totalPossibleVotes = totalPossibleVotes,
+	}
+
+	-- DEBUG: Log what's being sent
+	print("DEBUG notifyHosts: playerList count:", #playerList)
+	print("DEBUG notifyHosts: excluded count:", next(excluded) and "has entries" or "empty")
+	for k, v in pairs(excluded) do
+		print("DEBUG notifyHosts: excluded[" .. k .. "] =", v.canVote, v.canBeVoted, v.extraVotes)
+	end
+	if extra then
+		for k,v in extra do data[k] = v end
+	end
+	for _, p in Players:GetPlayers() do
+		if isHost(p) then
+			UpdateHostPanel:FireClient(p, data)
+		end
+	end
+end
+
+local function cancelTimer()
+	if timerThread then
+		task.cancel(timerThread)
+		timerThread = nil
+	end
+end
+
+-- ── Apply Abstentions w/ Extra Votes ───────────────────────
+local function applyAbstentions()
+	if not lastTeam then return end
+	local members = getTeamMembers(lastTeam)
+	for _, p in members do
+		local ex = excluded[p.UserId]
+		local canVote = not ex or ex.canVote
+		local votesUsed = hasVoted[p.UserId] or 0
+		local extraVotes = ex and ex.extraVotes or 0
+		local totalAllowed = 1 + extraVotes
+
+		if canVote and votesUsed < totalAllowed then
+			-- Only abstain if they used 0 votes
+			if votesUsed == 0 then
+				hasVoted[p.UserId] = 1
+				table.insert(votes, {
+					voter = p.DisplayName .. " (" .. p.Name .. ")",
+					voterUsername = p.Name,
+					target = p.DisplayName .. " (" .. p.Name .. ")",
+					targetUsername = p.Name,
+					nickname = "abstained",
+				})
+			end
+		end
+	end
+end
+
+-- ── End Vote ─────────────────────────────────────────────
+local function endVote(sendSnapshot)
+	cancelTimer()
+	applyAbstentions()
+
+	if sendSnapshot then
+		local modifications = {}
+		for _, p in Players:GetPlayers() do
+			local ex = excluded[p.UserId]
+			if ex then
+				local mods = {}
+				if not ex.canVote then
+					table.insert(mods, "cannot vote")
+				end
+				if not ex.canBeVoted then
+					table.insert(mods, "immune")
+				end
+				if ex.extraVotes and ex.extraVotes > 0 then
+					table.insert(mods, "+" .. ex.extraVotes .. " vote" .. (ex.extraVotes > 1 and "s" or ""))
+				end
+				if #mods > 0 then
+					table.insert(modifications, p.Name .. " (" .. table.concat(mods, ", ") .. ")")
+				end
+			end
+		end
+		-- Build display name map for receipt
+		local displayNameMap = {}
+		for _, p in Players:GetPlayers() do
+			displayNameMap[p.Name] = p.DisplayName
+		end
+
+		local tally = buildTally()
+		local voteReading, voteResult = buildVoteReading()
+
+		lastSnapshot = {
+			voteCount = voteCount,
+			team = lastTeam or "Unknown",
+			votes = table.clone(votes),
+			modifications = modifications,
+			timestamp = os.time(),
+			displayNames = displayNameMap,
+			tally = tally,
+			voteReading = voteReading,
+			voteResult = voteResult,
+		}
+	end
+
+	voteActive = false
+	votes      = {}
+	hasVoted   = {}
+	excluded   = {}
+	log("Vote ended, excluded table reset")
+
+	notifyHosts(sendSnapshot and { snapshot = lastSnapshot } or nil)
+	if sendSnapshot and lastSnapshot then
+		VoteResultBridge:Fire(lastSnapshot)
+	end
+end
+
+-- ── Helper: Convert string keys to numbers ──────────────────
+local function convertExcludedKeys(excl)
+	local converted = {}
+	for k, v in pairs(excl or {}) do
+		local numKey = tonumber(k)
+		if numKey then
+			converted[numKey] = v
+			log("Converted excluded key:", k, "->", numKey)
+		else
+			converted[k] = v
+		end
+	end
+	return converted
+end
+
+-- ── Begin Vote ───────────────────────────────────────────
+local function beginVote(teamName, excl, timerSeconds)
+	log("=== BEGIN VOTE ===")
+	log("Team:", teamName, "| Timer:", timerSeconds or 45)
+	cancelTimer()
+	voteActive = true
+	votes      = {}
+	hasVoted   = {}
+
+	if lastTeam ~= nil and teamName ~= lastTeam then
+		excluded = {}
+		log("Team changed, excluded table reset")
+	else
+		excluded = convertExcludedKeys(excl)
+		log("Excluded table after conversion:")
+		for k, v in pairs(excluded) do
+			log("  Key:", k, "(type:", type(k), ") canVote:", v.canVote, "canBeVoted:", v.canBeVoted, "extraVotes:", v.extraVotes)
+		end
+	end
+
+	lastTeam  = teamName
+	voteCount += 1
+	logExcluded()
+
+	local recipients = getTeamMembers(teamName)
+	local candidates = {}
+	for _, p in recipients do
+		local ex = excluded[p.UserId]
+		local canBeVoted = not ex or ex.canBeVoted
+		table.insert(candidates, {name = p.Name, displayName = p.DisplayName, disabled = not canBeVoted})
+	end
+
+	for _, p in recipients do
+		local ex = excluded[p.UserId]
+		local canVote = not ex or ex.canVote
+		hasVoted[p.UserId] = 0
+		if canVote then
+			local extraVotes = ex and ex.extraVotes or 0
+			StartVote:FireClient(p, { 
+				candidates = candidates,
+				timerSeconds = timerSeconds or 45,
+				extraVotes = extraVotes,
+				votesRemaining = 1 + extraVotes
+			})
+		else
+			StartVote:FireClient(p, { blocked = true })
+		end
+	end
+
+	timerThread = task.delay(timerSeconds or 45, function()
+		if voteActive then
+			log("Timer expired, ending vote")
+			endVote(true)
+		end
+	end)
+	log("=== END BEGIN VOTE ===")
+end
+
+-- ── Host Actions ─────────────────────────────────────────
+HostAction.OnServerEvent:Connect(function(player, actionType, data)
+	if not isHost(player) then return end
+
+	if actionType == "StartVote" then
+		if voteActive then return end
+		beginVote(data.teamName, data.excluded, data.timerSeconds)
+		notifyHosts()
+
+	elseif actionType == "RestartVote" then
+		local teamName = data.teamName or lastTeam
+		if not teamName then return end
+		beginVote(teamName, data.excluded, data.timerSeconds)
+		notifyHosts()
+
+	elseif actionType == "EndVote" then
+		endVote(true)
+
+	elseif actionType == "CancelVote" then
+		cancelTimer()
+		if lastTeam then
+			local members = getTeamMembers(lastTeam)
+			for _, p in members do
+				StartVote:FireClient(p, { cancelled = true })
+			end
+		end
+		voteActive = false
+		votes      = {}
+		hasVoted   = {}
+		log("Vote cancelled by host")
+		notifyHosts()
+
+	elseif actionType == "SetExclude" then
+		log("SetExclude received from", player.Name)
+		log("  userId:", data.userId, "| canVote:", data.canVote, "| canBeVoted:", data.canBeVoted, "| extraVotes:", data.extraVotes or 0)
+		excluded[data.userId] = {
+			canVote = data.canVote,
+			canBeVoted = data.canBeVoted,
+			extraVotes = data.extraVotes or 0
+		}
+		logExcluded()
+		notifyHosts()
+
+	elseif actionType == "RemoveExclude" then
+		log("RemoveExclude received from", player.Name)
+		log("  userId:", data.userId)
+		excluded[data.userId] = nil
+		logExcluded()
+		notifyHosts()
+
+	elseif actionType == "DeleteVote" then
+		for i, v in votes do
+			if v.voter == data.voter or v.voterUsername == data.voter then
+				table.remove(votes, i)
+				for _, p in Players:GetPlayers() do
+					if p.DisplayName == data.voter or p.Name == data.voter then
+						hasVoted[p.UserId] = nil
+						break
+					end
+				end
+				break
+			end
+		end
+		notifyHosts()
+
+	elseif actionType == "RequestUpdate" then
+		notifyHosts()
+	end
+end)
+
+-- ── Submit Vote ───────────────────────────────────────────
+SubmitVote.OnServerEvent:Connect(function(player, data)
+	if not voteActive then return end
+
+	local ex = excluded[player.UserId]
+	if ex and not ex.canVote then return end
+
+	local votesUsed = hasVoted[player.UserId] or 0
+	local extraVotes = ex and ex.extraVotes or 0
+	local totalAllowed = 1 + extraVotes
+
+	if votesUsed >= totalAllowed then return end
+
+	local targetPlayer = nil
+	for _, p in Players:GetPlayers() do
+		if p.Name == data.target or p.DisplayName == data.target then
+			targetPlayer = p
+			break
+		end
+	end
+	if not targetPlayer then return end
+
+	hasVoted[player.UserId] = votesUsed + 1
+	table.insert(votes, {
+		voter = player.DisplayName .. " (" .. player.Name .. ")",  -- DisplayName (username)
+		voterUsername = player.Name,
+		target = targetPlayer.DisplayName .. " (" .. targetPlayer.Name .. ")",  -- DisplayName (username)
+		targetUsername = targetPlayer.Name,
+		nickname = data.nickname or "",
+	})
+
+	-- If they have more votes, reopen the UI WITHOUT restarting timer
+	if hasVoted[player.UserId] < totalAllowed then
+		local recipients = getTeamMembers(lastTeam)
+		local candidates = {}
+		for _, p in recipients do
+			local pex = excluded[p.UserId]
+			local canBeVoted = not pex or pex.canBeVoted
+			table.insert(candidates, {name = p.Name, displayName = p.DisplayName, disabled = not canBeVoted})
+		end
+
+		StartVote:FireClient(player, { 
+			candidates = candidates,
+			isExtraVote = true,  -- Signal this is an extra vote, don't rebuild UI
+			extraVotes = extraVotes,
+			votesRemaining = totalAllowed - hasVoted[player.UserId]
+		})
+	else
+		-- All votes used, confirm the vote
+		StartVote:FireClient(player, { 
+			voteConfirmed = true,
+			targetDisplayName = targetPlayer.DisplayName,
+			nick = data.nickname or ""
+		})
+	end
+
+	notifyHosts()
+end)
+
+-- ── Push state to hosts on join ────────────────────────────
+Players.PlayerAdded:Connect(function(player)
+	task.wait(3)
+	if isHost(player) then
+		notifyHosts()
+	end
+end)
