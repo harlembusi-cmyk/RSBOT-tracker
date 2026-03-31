@@ -12,7 +12,7 @@ local RunService        = game:GetService("RunService")
 
 -- ── Config ────────────────────────────────────────────────
 -- Replace with your RoTunnel forwarding URL (see SETUP.md)
-local PROXY_URL    = "https://f1dd-110-174-37-80.ngrok-free.app/event"
+local PROXY_URL    = "https://divulsive-lipopectic-georgeann.ngrok-free.dev/event" -- MAKE SURE /EVENT IS ALWAYS FOLLOWED BY THE LINK
 local SECRET_KEY   = "changeme_secret_key" -- Must match ROBLOX_SECRET in your .env
 local PLACE_ID     = game.PlaceId
 local MIN_PLAYERS  = 10 -- Must match bot.js MIN_PLAYERS_FOR_SESSION
