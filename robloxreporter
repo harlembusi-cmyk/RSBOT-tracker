@@ -15,7 +15,7 @@ local RunService        = game:GetService("RunService")
 local PROXY_URL    = "https://f1dd-110-174-37-80.ngrok-free.app/event"
 local SECRET_KEY   = "changeme_secret_key" -- Must match ROBLOX_SECRET in your .env
 local PLACE_ID     = game.PlaceId
-local MIN_PLAYERS  = 10-- Must match bot.js MIN_PLAYERS_FOR_SESSION
+local MIN_PLAYERS  = 10 -- Must match bot.js MIN_PLAYERS_FOR_SESSION
 
 -- ── Player team tracking ───────────────────────────────────
 local playerTeams = {} -- username → current team name
@@ -49,11 +49,16 @@ end
 
 -- ── Send player count update ───────────────────────────────
 local function sendPlayerCount()
+	local currentPlayers = {}
+	for _, p in Players:GetPlayers() do
+		table.insert(currentPlayers, p.Name)
+	end
 	sendEvent({
-		type        = "PlayerCount",
-		placeId     = PLACE_ID,
-		count       = #Players:GetPlayers(),
-		hostPlayers = getHostPlayers(),
+		type           = "PlayerCount",
+		placeId        = PLACE_ID,
+		count          = #Players:GetPlayers(),
+		hostPlayers    = getHostPlayers(),
+		currentPlayers = currentPlayers,
 	})
 end
 
@@ -162,7 +167,6 @@ task.spawn(function()
 			}
 		})
 	end)
-
 
 	print("[RobloxReporter] Vote result listener active")
 end)
